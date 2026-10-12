@@ -308,52 +308,47 @@ def classify_network(host, exit_org, is_datacenter=None):
 
 
 def check_one(node, session):
-    """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
-    单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+    """直接在本地(GitHub Actions云端)检测单节点的连通性与握手"""
+    import socket
+    import ssl
+
+    host = node["host"]
+    port = int(node["port"])
     out = dict(node)
     out["protocol"] = "sstp"
-    out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+    out["link"] = f"sstp://vpn:vpn@{host}:{port}"
     out["status"] = "failed"
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    out["exit"] = None
-    out["residential"] = "unknown"
+    out["exit"] = {
+        "ip": node["ip"],
+        "country": node["country"],
+        "country_code": node["country_code"],
+        "city": "",
+        "continent": "",
+        "asn": "",
+        "org": "",
+        "type": "",
+        "is_datacenter": False,
+    }
+    out["residential"] = classify_network(out["host"], None, None)
+
+    # 直连握手检测：5秒超时，直接测通公网活跃的真实节点
+    t0 = time.time()
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
-        if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
-            out["worker_error"] = True
-            return out
-        j = r.json()
-        ok = bool(j.get("success"))
-        out["success"] = ok
-        out["status"] = "success" if ok else "failed"
-        out["latency_ms"] = j.get("responseTime")
-        out["colo"] = j.get("colo")
-        out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-        # SSTP 版 Worker: 顶层直接返回 exit, 含真实 is_datacenter 标志 + 嵌套 asn 对象
-        exit_info = j.get("exit") or {}
-        if exit_info:
-            asn = exit_info.get("asn") or {}
-            org = asn.get("org") or asn.get("name") or ""
-            out["exit"] = {
-                "ip": exit_info.get("ip"),
-                "country": exit_info.get("country"),
-                "country_code": exit_info.get("country_code"),
-                "city": exit_info.get("city"),
-                "continent": exit_info.get("continent"),
-                "asn": asn.get("asn"),
-                "org": org,
-                "type": asn.get("type"),
-                "is_datacenter": exit_info.get("is_datacenter"),
-            }
-            out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
-        else:
-            out["residential"] = classify_network(out["host"], None, None)
-        return out
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                elapsed_ms = int((time.time() - t0) * 1000)
+                out["success"] = True
+                out["status"] = "success"
+                out["latency_ms"] = elapsed_ms
+                out["colo"] = "DIRECT"
+                return out
     except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {exc}"
-        out["worker_error"] = True
+        out["success"] = False
+        out["error"] = str(exc)
         return out
 
 
